@@ -599,7 +599,12 @@ function processEmphasis(toks) {
         const bar = barriers.get(d.ch);
         for (let s = stack.length - 1; s >= 0; s--) {
           const o = stack[s];
-          if (bar !== undefined && o.delimIdx <= bar.idx && o.len < bar.len) break;
+          // a blocked opener is skipped, not a stop sign: an earlier
+          // opener that is NOT shorter than the barrier is still
+          // matchable (`**a *b **c** d* e**`: the outer `**` must still
+          // pair with the final `**` even though the inner `*` is
+          // barrier-blocked)
+          if (bar !== undefined && o.delimIdx <= bar.idx && o.len < bar.len) continue;
           if (o.ch !== d.ch) continue;
           if (!o.canOpen) continue;
           if (d.ch === '~' && o.len !== d.len) continue;

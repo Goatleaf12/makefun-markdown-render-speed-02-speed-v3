@@ -1252,7 +1252,10 @@ function parseHtmlBlock(lines, i, end, realEnd, hb) {
   }
   let text = lines.slice(i, j).join('\n');
   if (j < lines.length) text += '\n';
-  if (j < realEnd && isBlank(lines[j])) text = text.slice(0, -1);
+  // one trailing \n is deleted only when the next line is TRULY empty
+  // (zero characters) — a whitespace-only line (spaces/tabs) is a blank
+  // line for block separation but does NOT delete the \n
+  if (j < realEnd && lines[j] === '') text = text.slice(0, -1);
   return { text, next: j };
 }
 

@@ -573,6 +573,15 @@ function processEmphasis(toks) {
   }
   // stack of delimiter objects still available
   const stack = [];
+  // suffix: strongAfter[ch][i] = a closer of char ch with len>=2 exists
+  // at a delimiter index >= i (precomputed so the lone-`*` lookahead
+  // below is O(1) instead of a scan)
+  const strongAfter = { '*': new Array(delims.length + 1).fill(false), '_': new Array(delims.length + 1).fill(false), '~': new Array(delims.length + 1).fill(false) };
+  for (let i = delims.length - 1; i >= 0; i--) {
+    for (const ch of ['*', '_', '~']) strongAfter[ch][i] = strongAfter[ch][i + 1];
+    const dd = delims[i];
+    if (dd.canClose && dd.len >= 2) strongAfter[dd.ch][i] = true;
+  }
   // barrier per delimiter char: openers at or before this delim index are
   // blocked for future closers of that char — but only openers SHORTER
   // than the inner opener that set the barrier. Set when a closer that
@@ -604,12 +613,7 @@ function processEmphasis(toks) {
           // the other two) — only skip when the opener would be left
           // with fewer than 2 stars for the later strong closer.
           if (d.len === 1 && o.len === 2) {
-            let laterStrong = false;
-            for (let q = d.delimIdx + 1; q < delims.length; q++) {
-              const nd = delims[q];
-              if (nd.ch === d.ch && nd.canClose && nd.len >= 2) { laterStrong = true; break; }
-            }
-            if (laterStrong) continue;
+            if (strongAfter[d.ch][d.delimIdx + 1]) continue;
           }
           // match
           let use;

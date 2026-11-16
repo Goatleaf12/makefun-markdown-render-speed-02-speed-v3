@@ -595,6 +595,22 @@ function processEmphasis(toks) {
           if (!o.canOpen) continue;
           if (d.ch === '~' && o.len !== d.len) continue;
           if ((o.canClose || d.canOpen) && ((o.len + d.len) % 3 === 0) && !((o.len % 3 === 0) && (d.len % 3 === 0))) continue;
+          // a single `*` closer must not eat one star of a `**` opener
+          // when a later `**` closer would take the whole opener as
+          // strong (`**public as *so*other* option html**`: the lone
+          // `*` after `other` stays literal, the outer `**` pairs with
+          // the final `**`). But a `***` opener has stars to spare
+          // (`***foo* bar**`: the `*` takes one, the final `**` takes
+          // the other two) — only skip when the opener would be left
+          // with fewer than 2 stars for the later strong closer.
+          if (d.len === 1 && o.len === 2) {
+            let laterStrong = false;
+            for (let q = d.delimIdx + 1; q < delims.length; q++) {
+              const nd = delims[q];
+              if (nd.ch === d.ch && nd.canClose && nd.len >= 2) { laterStrong = true; break; }
+            }
+            if (laterStrong) continue;
+          }
           // match
           let use;
           if (d.ch === '~') use = d.len;

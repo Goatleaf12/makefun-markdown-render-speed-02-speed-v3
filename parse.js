@@ -168,6 +168,19 @@ function stripIndentWs(line, n) {
   }
   return line.slice(i);
 }
+// Remove up to n LEADING WHITESPACE CHARACTERS (each space/tab counts
+// as one character, no tab expansion). Used for backtick-fence dedent:
+// marked strips the fence's indent in characters, so a tab in the
+// content counts as 1, not as a jump to the next multiple of 4.
+function stripIndentChars(line, n) {
+  let i = 0;
+  while (i < line.length && i < n) {
+    const c = line.charCodeAt(i);
+    if (c === 32 || c === 9) i++;
+    else break;
+  }
+  return line.slice(i);
+}
 function trimLine(s) {
   let a = 0, b = s.length;
   while (a < b && (s.charCodeAt(a) === 32 || s.charCodeAt(a) === 9)) a++;
@@ -324,39 +337,18 @@ function findClosingBackticks(s, from, len) {
   return -1;
 }
 
-// Trim a bare GFM autolink URL per the GFM rules (entity ;, trailing punct,
-// paren balance). Input is the raw run; returns the trimmed URL.
+// Trim a bare GFM autolink URL with marked's _backpedal regex, applied
+// until stable: a `(` group only counts when it has a closing `)` after
+// it inside the URL, so `https://a.io)](https://b.io` is cut at the `(`
+// (the `)` before it does not close it), while `https://a.io/foo(bar)`
+// keeps its balanced group.
+const AUTOLINK_BACKPEDAL = /(?:[^?!.,:;*_'\"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'\"~)]+(?!$))+/;
 function trimAutolinkUrl(u) {
-  while (u.length > 0) {
-    // entity-like trailing ;  (e.g. ...foo&copy; -> cut before &)
-    if (u.endsWith(';')) {
-      const amp = u.lastIndexOf('&');
-      if (amp >= 0 && /^&[A-Za-z0-9]+;$/.test(u.slice(amp))) { u = u.slice(0, amp); continue; }
-    }
-    const last = u[u.length - 1];
-    if (last === '?' || last === '!' || last === '.' || last === ',' || last === ':' || last === ';' || last === '*' || last === '_' || last === '~' || last === "'" || last === '"') {
-      u = u.slice(0, -1); continue;
-    }
-    if (last === ')') {
-      let open = 0, close = 0;
-      for (let k = 0; k < u.length; k++) { if (u[k] === '(') open++; else if (u[k] === ')') close++; }
-      if (close > open) { u = u.slice(0, -1); continue; }
-    }
-    // unmatched '(' : cut at the last '(' that has no ')' after it
-    let open = 0, close = 0;
-    for (let k = 0; k < u.length; k++) { if (u[k] === '(') open++; else if (u[k] === ')') close++; }
-    if (open > close) {
-      // find the '(' whose match is missing: scan from the end
-      let depth = 0;
-      let cut = -1;
-      for (let k = u.length - 1; k >= 0; k--) {
-        if (u[k] === ')') depth++;
-        else if (u[k] === '(') { if (depth === 0) { cut = k; break; } depth--; }
-      }
-      if (cut >= 0) { u = u.slice(0, cut); continue; }
-    }
-    break;
-  }
+  let prev;
+  do {
+    prev = u;
+    u = AUTOLINK_BACKPEDAL.exec(u)?.[0] ?? '';
+  } while (u !== prev);
   return u;
 }
 function validDomain(dom) {
@@ -490,6 +482,38 @@ function parseInlineLinkTail(s, j) {
 
 // Scan a bracket label starting at i (s[i] === '['). Returns {label, end}
 // where end is just past the closing ']', or null.
+// Find the closing run of a code span inside a link label. Backtick
+// runs nest: a run of a different length than the one on top of the
+// stack opens a nested span that must close before the outer one can
+// (so `` ``b`c `` `` hides the `]`, but `` ``b` c `` `` — one lone
+// backtick inside — never closes and does not hide it). Returns the
+// index of the closing run's start, or -1 if the span never closes on
+// this line (a newline ends the search: a span crossing lines does
+// not hide the `]` either).
+function findLabelSpanClose(s, from, len) {
+  const stack = [len];
+  let i = from;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === '\n') return -1;
+    if (c === '`') {
+      let k = i;
+      while (k < s.length && s[k] === '`') k++;
+      const runLen = k - i;
+      if (runLen === stack[stack.length - 1]) {
+        stack.pop();
+        if (stack.length === 0) return i;
+      } else {
+        stack.push(runLen);
+      }
+      i = k;
+    } else {
+      i++;
+    }
+  }
+  return -1;
+}
+
 function scanLabel(s, i) {
   const n = s.length;
   let depth = 1;
@@ -501,16 +525,29 @@ function scanLabel(s, i) {
       let k = j;
       while (k < n && s[k] === '`') k++;
       const len = k - j;
-      const close = findClosingBackticks(s, k, len);
-      if (close < 0) { j = k; continue; }
-      // a code span in a label only hides a `]` when it closes on the
-      // same line: an unclosed `` ``url` `` must not swallow the `]` by
-      // closing at a `` `` `` on a later line (the label ends here)
-      if (s.slice(k, close).indexOf('\n') >= 0) { j = k; continue; }
-      let m = close;
-      while (m < n && s[m] === '`') m++;
-      j = m;
-      continue;
+      // marked's label regex only matches a backtick run as a code
+      // span (opening run + non-backtick content + closing run of
+      // any length — the regex does not nest) or, for a run of 2+,
+      // immediately before the label's `]`. A run that matches
+      // neither makes the whole label unmatchable, so the link
+      // fails (e.g. `[a `b](c) d`, `[a ``b](c) d`, and the
+      // `` `` a ` b `` `` in doc-16). A code span may hide a `]`
+      // (its content can contain `]`), but not a newline.
+      let m = k;
+      let closed = false;
+      while (m < n) {
+        if (s[m] === '\n') break;
+        if (s[m] === '`') { closed = true; break; }
+        m++;
+      }
+      if (closed) {
+        let e = m;
+        while (e < n && s[e] === '`') e++;
+        j = e;
+        continue;
+      }
+      if (len >= 2 && s[k] === ']') { j = k; continue; }
+      return null;
     }
     if (c === '<') {
       // a '<' that could start an HTML tag or autolink must be closed
@@ -603,8 +640,12 @@ function processEmphasis(toks) {
           // opener that is NOT shorter than the barrier is still
           // matchable (`**a *b **c** d* e**`: the outer `**` must still
           // pair with the final `**` even though the inner `*` is
-          // barrier-blocked)
-          if (bar !== undefined && o.delimIdx <= bar.idx && o.len < bar.len) continue;
+          // barrier-blocked). The barrier never blocks the very closer
+          // run that set it (see the setter comment below), and a
+          // closer run of length >= 3 penetrates the barrier
+          // (`*a **b**c***` forms the outer em, while `*a **b**c*`
+          // with a lone `*` closer does not).
+          if (bar !== undefined && bar.setter !== d && d.len < 3 && o.delimIdx <= bar.idx && o.len < bar.len) continue;
           if (o.ch !== d.ch) continue;
           if (!o.canOpen) continue;
           if (d.ch === '~' && o.len !== d.len) continue;
@@ -627,14 +668,49 @@ function processEmphasis(toks) {
           const tag = d.ch === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
           const oi = o.tokIdx, ci = d.tokIdx;
           const oLenBefore = o.len;
+          // marked's greedy scan skips a closer run by the rule of 3
+          // (`(openerLen + closerLen) % 3 == 0`, opener not a multiple
+          // of 3) and accumulates its length into `f`; the final closer
+          // then uses `min(b, b+x+f)`, so the raw swallows the whole
+          // run and the leftover stars land INSIDE the tag
+          // (`**a *b*c***` -> `<strong>a <em>b</em>c*</strong>`).
+          // With no skipped closer (`f == 0`) the leftover stays
+          // outside (`**foo***` -> `<strong>foo</strong>*`). Count the
+          // skipped length among delimiter runs strictly between the
+          // opener and this closer (a "both" delimiter: can open and
+          // close, i.e. marked's RDelim groups 5/6).
+          let fSkip = 0;
+          // only needed when a leftover exists to place
+          if (d.len - use > 0 && o.len % 3 !== 0) {
+            for (let k = o.delimIdx + 1; k < d.delimIdx; k++) {
+              const c = delims[k];
+              if (c.ch !== d.ch) continue;
+              if (!c.canOpen || !c.canClose) continue;
+              if ((o.len + c.origLen) % 3 === 0) fSkip += c.origLen;
+            }
+          }
+          const leftoverInside = fSkip > 0 && d.len - use > 0;
           // insert open tag after opener token, close tag before closer token
           toks.splice(oi + 1, 0, { k: 'tag', s: '<' + tag + '>' });
           // closer index shifted by the insertion
-          toks.splice(ci + 1, 0, { k: 'tag', s: '</' + tag + '>' });
-          // re-index delimiter token positions after splice: recompute tokIdx
-          for (let k = 0; k < toks.length; k++) if (toks[k].k === 'delim') toks[k].tokIdx = k;
+          if (leftoverInside) {
+            // leftover stars as text before the close tag; the closer
+            // token itself is spent (len 0) so it renders nothing after
+            toks.splice(ci + 1, 0, { k: 'text', s: d.ch.repeat(d.len - use) });
+            toks.splice(ci + 2, 0, { k: 'tag', s: '</' + tag + '>' });
+          } else {
+            toks.splice(ci + 1, 0, { k: 'tag', s: '</' + tag + '>' });
+          }
+          // re-index delimiter token positions after the splices
+          // (incremental: only delims shift, and only those past the
+          // insertion points) instead of rescanning all tokens
+          const nIns = leftoverInside ? 2 : 1;
+          for (const dd of delims) {
+            if (dd.tokIdx > oi && dd.tokIdx < ci) dd.tokIdx += 1;
+            else if (dd.tokIdx >= ci) dd.tokIdx += 1 + nIns;
+          }
           o.len -= use;
-          d.len -= use;
+          d.len = leftoverInside ? 0 : d.len - use;
           // delimiters between the opener and closer are now inside the
           // emphasis and cannot span outside it — drop them from the stack
           stack.splice(s + 1);
@@ -646,10 +722,14 @@ function processEmphasis(toks) {
           }
           // a closer that can also open, matched against a pure opener
           // (one that cannot close), blocks shorter outer openers for
-          // later closers of the same char
+          // later closers of the same char — but NOT for the same closer
+          // run itself: a `***` run that closed the inner strong with
+          // two stars still closes the outer em with its last star
+          // (`*a **b***` forms the em, while `*a **b**c*` — a separate
+          // `*` closer — does not)
           if (d.canOpen && !o.canClose) {
             const prev = barriers.get(d.ch);
-            if (prev === undefined || o.delimIdx > prev.idx) barriers.set(d.ch, { idx: o.delimIdx, len: oLenBefore });
+            if (prev === undefined || o.delimIdx > prev.idx) barriers.set(d.ch, { idx: o.delimIdx, len: oLenBefore, setter: d });
           }
           matched = true;
           break;
@@ -794,9 +874,31 @@ function tryEmailAt(s, i, txt) {
   return { end, href: 'mailto:' + email, text: prefix + email, localLen: (txt.length - localStart) };
 }
 
+// ---------- marked's inline masking (for emphasis) ----------
+// marked tokenizes emphasis against a MASKED copy of the paragraph:
+// code spans and `[...](...)` / `[...][...]` patterns are replaced by
+// `[aaa...]` (same length), so a `*`/`_` inside one is invisible to the
+// emphasis tokenizer. A mismatched code span in a link label
+// (`` ``b` ``: 2 open, 1 close) makes the masker pair it with the NEXT
+// `` `` `` run, swallowing everything between — including a later
+// `_..._` — so that em never forms. Replicate the two mask regexes
+// exactly (marked 18.1.3, GFM, lookbehind supported so Oe=true).
+const MASK_CT = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const MASK_GT = /(?:\[(?:[^\[\]`]|(`+)[^`]+\1(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(`+)[^`]+\3(?!`)|<(?! )[^<>]*?>)/g;
+function maskedInlineSrc(s) {
+  let t = s.replace(MASK_CT, (n, g1, g2) => g2 ? '+'.repeat(n.length) : g1 ? g1 + n.slice(g1.length, -g1.length).replace(/`/g, '+') + g1 : n);
+  t = t.replace(MASK_GT, (n) => '[' + 'a'.repeat(n.length - 2) + ']');
+  return t;
+}
+
 // Full inline parse of a string -> {html, hasLink}
 function inlineParse(s, refs, st) {
   if (s === '') return { html: '', hasLink: false, toks: [] };
+  // masked copy: a delimiter run hidden by the mask is literal text.
+  // The mask only ever hides a delimiter inside a code span or a
+  // `[...](...)` / `[...][...]` pattern, so skip it entirely when the
+  // text has no backtick and no `[` (the common case).
+  const mask = (s.includes('*') || s.includes('_') || s.includes('~')) && (s.includes('`') || s.includes('[')) ? maskedInlineSrc(s) : null;
   // Integrated scan: like inlineTokens but with bare-autolink detection.
   // We re-implement the scan here so text runs can be split at autolink starts.
   const toks = [];
@@ -896,6 +998,9 @@ function inlineParse(s, refs, st) {
       while (j < n && s[j] === c) j++;
       const len = j - i;
       if (c === '~' && len > 2) { txt += '~'.repeat(len); i = j; continue; }
+      // hidden by the inline mask (inside a masked code span / link
+      // pattern) -> literal text, never an emphasis delimiter
+      if (mask && mask.slice(i, j) !== s.slice(i, j)) { txt += c.repeat(len); i = j; continue; }
       const fl = flankInfo(s, i, j);
       let canOpen, canClose;
       if (c === '_') {
@@ -907,7 +1012,7 @@ function inlineParse(s, refs, st) {
       }
       if (!canOpen && !canClose) { txt += c.repeat(len); i = j; continue; }
       flush();
-      toks.push({ k: 'delim', ch: c, len, canOpen, canClose, afterWs: j >= n || s[j] === ' ' || s[j] === '\t' || s[j] === '\n' });
+      toks.push({ k: 'delim', ch: c, len, origLen: len, canOpen, canClose, afterWs: j >= n || s[j] === ' ' || s[j] === '\t' || s[j] === '\n' });
       i = j;
       continue;
     }
@@ -1277,10 +1382,10 @@ function parseHtmlBlock(lines, i, end, realEnd, hb) {
   }
   let text = lines.slice(i, j).join('\n');
   if (j < lines.length) text += '\n';
-  // one trailing \n is deleted only when the next line is TRULY empty
-  // (zero characters) — a whitespace-only line (spaces/tabs) is a blank
-  // line for block separation but does NOT delete the \n
-  if (j < realEnd && lines[j] === '') text = text.slice(0, -1);
+  // one trailing \n is deleted when the next line is blank — for HTML
+  // block types 6-7 a whitespace-only line counts as blank (it ends
+  // the block), but for types 1-5 only a TRULY empty line deletes it
+  if (j < realEnd && (hb.type >= 6 ? isBlank(lines[j]) : lines[j] === '')) text = text.slice(0, -1);
   return { text, next: j };
 }
 
@@ -1521,13 +1626,23 @@ function parseBlockquote(lines, i, end, realEnd, refs) {
     } else {
       // inside a fence, a line without '>' ends the blockquote
       if (fence) break;
+      // a list-marker line with indent < 4 is not a lazy continuation —
+      // it ends the blockquote and starts a top-level list (an ordered
+      // marker like `3.` does not interrupt a paragraph, so it would
+      // otherwise be glued into the quote as text)
+      const lcontent0 = line.slice(idx);
+      if (parseListMarker(lcontent0) && cols < 4) break;
       if (inPara && !paraInterruptLine(line, cols, idx)) {
-        // lazy continuation: strip up to 4 columns of leading whitespace
-        // (a lazy `    - bar` is paragraph text `- bar`, not a list)
-        let cl = stripIndentWs(line, 4);
+        // lazy continuation: leading whitespace under 4 columns is kept
+        // verbatim; at 4+ columns strip up to 4 (a lazy `    - bar` is
+        // paragraph text `- bar`, not a list)
+        const stripped = stripIndentWs(line, 4);
+        let cl = cols < 4 ? line : stripped;
         // a lazy setext underline after another lazy line is NOT a
         // heading: indent it 4 columns so it stays paragraph text
-        if (prevLazy && setextLevel(cl, 0, 0) === 1) cl = '    ' + cl;
+        // (detection uses the stripped form; the pushed line is the
+        // verbatim one plus the 4-column hack)
+        if (prevLazy && setextLevel(stripped, 0, 0) === 1) cl = '    ' + cl;
         // if the dedented lazy line would start a block of its own (list,
         // heading, fence, hr, html, quote), it must stay paragraph text:
         // glue it onto the previous content line instead of adding it as
@@ -1560,6 +1675,7 @@ function parseList(lines, i, end, realEnd, refs) {
   const startNum = firstMarker.num;
   const items = [];
   let loose = false;
+  let endedByNewList = false;
   let j = i;
   while (j < end) {
     const itemLine = lines[j];
@@ -1606,9 +1722,14 @@ function parseList(lines, i, end, realEnd, refs) {
         const { cols: ncols, idx: nidx } = leadingInfo(nl);
         const ncontent = nl.slice(nidx);
         const nmarker = parseListMarker(ncontent);
+        // a marker at or past the item's content indent is a nested
+        // list inside this item, not a new item of this list
+        // (`1. A` / `2. B` / `   1. C` / blank / `   2. D`: the
+        // `2. D` at indent 3 = cIndent is a sublist item; only a
+        // marker BELOW cIndent is a sibling item)
         const isNewItem = !!nmarker && nmarker.ordered === isOrdered &&
           (isOrdered ? nmarker.delim === delim : nmarker.bullet === bullet) &&
-          ncols >= firstCols && ncols <= firstCols + 3;
+          ncols >= firstCols && ncols <= firstCols + 3 && ncols < cIndent;
         const continuesItem = ncols >= cIndent;
         // an empty item cannot pick up content after a blank line
         // (`-\n\n  foo` is an empty <li> plus a top-level paragraph)
@@ -1646,11 +1767,24 @@ function parseList(lines, i, end, realEnd, refs) {
       // a lazy line. (A marker indented past 3 columns is not a list item
       // at all, so it falls through to the lazy branch below.)
       if (lmarker && lcols < cIndent && lcols >= firstCols && lcols <= firstCols + 3) break;
+      // a list-marker line indented LESS than the list's first indent
+      // ends the whole list ONLY when it is a different list (other
+      // type/bullet/delim) — it is a new top-level list, not a lazy
+      // line of the last item (and not a nested list inside it). The
+      // same list just continues at a lower indent (`  - a` then `- b`
+      // is one list): break out of the item and let the outer loop
+      // decide, instead of ending the list here.
+      if (lmarker && lcols < firstCols) {
+        if (lmarker.ordered !== isOrdered ||
+            (isOrdered ? lmarker.delim !== delim : lmarker.bullet !== bullet)) endedByNewList = true;
+        break;
+      }
       if (inPara && !paraInterruptLine(expanded, lcols, lidx)) {
-        // lazy continuation inside an item is dedented by the item's
+        // lazy continuation inside an item: leading whitespace under 4
+        // columns is kept verbatim; at 4+ columns dedent by the item's
         // content indent (`    with two lines.` under a 6-column item
         // is `with two lines.`)
-        const cl = stripIndentWs(expanded, cIndent);
+        const cl = lcols < 4 ? expanded : stripIndentWs(expanded, cIndent);
         // if the dedented lazy line would start a block of its own (a
         // list marker like `- e`), it must stay paragraph text: glue it
         // onto the previous item line
@@ -1674,6 +1808,7 @@ function parseList(lines, i, end, realEnd, refs) {
     if (out.blankBetween) loose = true;
     items.push(children);
     j = k;
+    if (endedByNewList) break;
   }
   return { node: { t: 'list', ordered: isOrdered, start: startNum, loose, items }, next: j };
 }
@@ -1802,7 +1937,9 @@ function parseBlocks(lines, start, end, realEnd, refs, out, inList) {
         let closed = false;
         while (k < end) {
           if (isClosingFence(lines[k], f)) { closed = true; k++; break; }
-          codeLines.push(stripIndentWs(lines[k], f.cols));
+          // backtick fences dedent content by the fence indent, counted
+          // in characters (a tab is 1); tilde fences keep content verbatim
+          codeLines.push(f.ch === '~' ? lines[k] : stripIndentChars(lines[k], f.cols));
           k++;
         }
         if (codeLines.length > 0 && codeLines[codeLines.length - 1] === '') codeLines.pop();
@@ -1868,7 +2005,11 @@ function parseBlocks(lines, start, end, realEnd, refs, out, inList) {
 
 export function parse(src) {
   const lines = splitLines(src);
-  const realEnd = src.endsWith('\n') ? lines.length - 1 : lines.length;
+  // `realEnd` counts real lines (excl. the split artifact). splitLines
+  // normalizes a trailing \r to \n, so a src ending in \r still gains
+  // a phantom '' line — measure from the normalized string, not src.
+  const norm = src.replace(/\r\n?/g, '\n');
+  const realEnd = norm.endsWith('\n') ? lines.length - 1 : lines.length;
   const refs = new Map();
   const st = { inLink: false };
   const blocks = parseBlocks(lines, 0, realEnd, realEnd, refs);

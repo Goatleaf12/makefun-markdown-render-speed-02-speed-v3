@@ -713,11 +713,31 @@ function tryEmailAt(s, i, txt) {
   if (!m) return null;
   // the domain must not be immediately followed by '-' or '_': those
   // would be part of the domain and make it invalid (`a.b-c_d@a.b-`,
-  // `a.b-c_d@a.b_` are not emails)
+  // `a.b-c_d@a.b_` are not emails). EXCEPT when the `_` is an emphasis
+  // closer (an unmatched `_` opener precedes the email in this line):
+  // `_warning when@atlas.example.com_` IS an email. Otherwise marked
+  // backtracks one domain segment (`when@atlas.example.com_` ->
+  // `when@atlas.example`), and if no dotted domain remains, no email.
   const after = rest[m[0].length];
-  if (after === '-' || after === '_') return null;
-  let email = local + '@' + m[0];
-  let end = i + 1 + m[0].length;
+  if (after === '-') return null;
+  let dom = m[0];
+  if (after === '_') {
+    // is there a `_` opener before the email in this line?
+    let hasOpener = false;
+    for (let q = i - 1; q >= 0 && i - q < 400; q--) {
+      const ch = s[q];
+      if (ch === '\n') break;
+      if (ch === '_' && (q === 0 || s[q - 1] === ' ' || s[q - 1] === '\t' || s[q - 1] === '\n') && q + 1 < s.length && s[q + 1] !== ' ' && s[q + 1] !== '\t' && s[q + 1] !== '\n') { hasOpener = true; break; }
+    }
+    if (!hasOpener) {
+      const dot = dom.lastIndexOf('.');
+      if (dot <= 0) return null;
+      dom = dom.slice(0, dot);
+      if (dom.indexOf('.') < 0) return null;
+    }
+  }
+  let email = local + '@' + dom;
+  let end = i + 1 + dom.length;
   if (prefix) {
     // a scheme link may extend over one path segment after the email
     // (`xmpp:foo@bar.baz/txt` but not `/txt/bin`)

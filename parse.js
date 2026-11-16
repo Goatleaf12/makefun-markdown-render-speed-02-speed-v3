@@ -366,6 +366,16 @@ function validDomain(dom) {
   // alnum/hyphen char is enough; the rest is consumed by [^\s<]*.
   return dom.length > 0 && /^[A-Za-z0-9-]/.test(dom);
 }
+// case-insensitive http:// or https:// at s[j], without slicing/regex
+function hasScheme(s, j) {
+  const a = s[j + 1], b = s[j + 2], c = s[j + 3], d = s[j + 4];
+  if ((a === 't' || a === 'T') && (b === 't' || b === 'T') && (c === 'p' || c === 'P')) {
+    if (s[j + 4] === ':' && s[j + 5] === '/' && s[j + 6] === '/') return true;
+    if ((d === 's' || d === 'S') && s[j + 5] === ':' && s[j + 6] === '/' && s[j + 7] === '/') return true;
+  }
+  return false;
+}
+
 // Try a bare GFM autolink (www. / scheme) at position i. Returns
 // {end, href, text} or null. prevCh is the char before i ('' at start).
 // Email autolinks are handled separately at the '@' (see inlineParse).
@@ -805,8 +815,8 @@ function inlineParse(s, refs, st) {
         if (cc === '\\' || cc === '`' || cc === '*' || cc === '_' || cc === '~' || cc === '[' || cc === '!' || cc === '<' || cc === '&' || cc === '\n' || cc === '@') break;
         // stop text run at a possible autolink start so it can be detected
         if (!st.inLink && cc === 'w' && s.startsWith('www.', j)) break;
-        if (!st.inLink && (cc === 'h' || cc === 'H') && /^(https?:\/\/)/i.test(s.slice(j, j + 8))) break;
-        if (!st.inLink && (cc === 'f' || cc === 'F') && /^ftp:\/\//i.test(s.slice(j, j + 6))) break;
+        if (!st.inLink && (cc === 'h' || cc === 'H') && hasScheme(s, j)) break;
+        if (!st.inLink && (cc === 'f' || cc === 'F') && s.slice(j, j + 6).toLowerCase() === 'ftp://') break;
         j++;
       }
       txt += escText(s.slice(i, j));
